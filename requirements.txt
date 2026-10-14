@@ -1,0 +1,10 @@
+python-dotenv
+mcp
+langchain>=1.0
+langchain-core>=1.0
+langchain-deepseek
+langgraph
+fastapi
+uvicorn[standard]
+httpx
+tavily-python
