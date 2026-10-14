@@ -1,49 +1,94 @@
 """旅游助手 MCP Server V2：真实 API + 模拟数据双模式"""
 import os
 import json
-from dotenv import load_dotenv
-load_dotenv()
+import logging
+import math
+import re
+import sys
+import time
+from datetime import date
+from urllib.parse import quote
+
+from travel_config import MAX_TRAVEL_DAYS, SUPPORTED_CITIES
 from mcp.server.fastmcp import FastMCP
 
 mcp = FastMCP("旅游数据服务 V2")
 
 # ====== API 密钥 ======
 WEATHER_API_KEY = os.getenv("WEATHER_API_KEY", "")
+WEATHER_API_HOST = os.getenv("WEATHER_API_HOST", "").strip().lower()
 TAVILY_API_KEY = os.getenv("TAVILY_API_KEY", "")
+logger = logging.getLogger(__name__)
+_weather_cache = {}
+# Approximate city-center coordinates used for city-level forecasts.
+CITY_COORDINATES = {
+    "北京": (39.90, 116.40), "上海": (31.23, 121.47), "西安": (34.26, 108.94),
+    "成都": (30.67, 104.07), "重庆": (29.56, 106.55), "广州": (23.13, 113.26),
+    "南京": (32.06, 118.80), "杭州": (30.27, 120.15), "苏州": (31.30, 120.59),
+}
+
+
+def _cached_weather(provider, city, fetch):
+    """Bounded ten-minute cache; failed responses are not cached."""
+    if os.getenv("TRAVEL_OFFLINE", "").lower() in ("1", "true", "yes"):
+        return None
+    key = (provider, city)
+    cached = _weather_cache.get(key)
+    if cached and cached[0] > time.monotonic():
+        return cached[1]
+    value = fetch()
+    if value:
+        if len(_weather_cache) >= 64:
+            _weather_cache.pop(next(iter(_weather_cache)))
+        _weather_cache[key] = (time.monotonic() + 600, value)
+    return value
 
 
 def fetch_weather_wttr(city: str) -> str:
     """通过 wttr.in 查询天气（无需 API Key，全球城市）"""
     import httpx
-    try:
-        resp = httpx.get(
-            f"https://wttr.in/{city}?format=%C+%t&lang=zh",
-            timeout=10,
-        )
-        if resp.status_code == 200:
-            return resp.text.strip()
-    except Exception:
-        pass
-    return ""
+    def fetch():
+        try:
+            resp = httpx.get(f"https://wttr.in/{quote(city, safe='')}?format=%C+%t&lang=zh", timeout=8)
+            resp.raise_for_status()
+            text = resp.text.strip()
+            return text if len(text) < 300 and "<html" not in text.lower() else ""
+        except httpx.HTTPError:
+            return ""
+    return _cached_weather("wttr", city, fetch) or ""
 
 
 def fetch_weather_qweather(city: str) -> list | None:
     """通过和风天气 API 查询（需要 WEATHER_API_KEY）"""
-    if not WEATHER_API_KEY:
+    if not WEATHER_API_KEY or city not in CITY_COORDINATES:
+        return None
+    if not re.fullmatch(r"[a-z0-9]+(?:[.-][a-z0-9]+)*\.qweatherapi\.com", WEATHER_API_HOST):
         return None
     import httpx
-    try:
-        resp = httpx.get(
-            "https://devapi.qweather.com/v7/weather/3d",
-            params={"location": city, "key": WEATHER_API_KEY},
-            timeout=10,
-        )
-        data = resp.json()
-        if data.get("code") == "200":
-            return data["daily"]
-    except Exception:
-        pass
-    return None
+    def fetch():
+        try:
+            latitude, longitude = CITY_COORDINATES[city]
+            resp = httpx.get(
+                f"https://{WEATHER_API_HOST}/weather/v1/daily/{latitude}/{longitude}",
+                headers={"X-QW-Api-Key": WEATHER_API_KEY},
+                params={"days": 3, "localTime": "true", "lang": "zh"}, timeout=8,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            days = data.get("days")
+            if isinstance(days, list) and days:
+                attributions = data.get("metadata", {}).get("attributions", [])
+                return [{
+                    "tempMax": day["temperatureMax"]["value"],
+                    "tempMin": day["temperatureMin"]["value"],
+                    "textDay": day["daytime"]["condition"]["text"],
+                    "fxDate": day["daytime"]["forecastStartTime"][:10],
+                    "attributions": attributions,
+                } for day in days]
+        except (httpx.HTTPError, ValueError, TypeError, AttributeError, KeyError):
+            pass
+        return None
+    return _cached_weather("qweather", city, fetch)
 
 # ====== 模拟数据（兜底） ======
 MOCK_WEATHER = {
@@ -94,7 +139,8 @@ MOCK_FOOD = {
     "成都": ["火锅(约100元/人)", "串串香(约60元/人)", "担担面(约15元)"],
 }
 
-VALID_CITIES = set(MOCK_SPOTS.keys()) | {"重庆", "广州", "南京", "杭州", "苏州"}  # 支持的额外城市
+VALID_CITIES = set(SUPPORTED_CITIES)
+INDOOR_SPOTS = {"国家博物馆", "上海博物馆"}
 
 
 def validate_city(city: str) -> str | None:
@@ -104,6 +150,18 @@ def validate_city(city: str) -> str | None:
     return f"不支持的城市「{city}」，可选: {', '.join(sorted(VALID_CITIES))}"
 
 
+def validate_trip(days, budget=0):
+    if isinstance(days, bool) or not isinstance(days, int) or not 1 <= days <= MAX_TRAVEL_DAYS:
+        return f"天数必须是 1—{MAX_TRAVEL_DAYS} 的整数。"
+    if isinstance(budget, bool) or not isinstance(budget, int) or budget < 0:
+        return "预算必须是非负整数，0 表示未指定预算。"
+    return None
+
+
+def validate_month(month):
+    return None if re.fullmatch(r"(?:[1-9]|1[0-2])月", month) else "月份格式应为 1月—12月。"
+
+
 def haversine(lat1, lng1, lat2, lng2):
     """计算两点间球面距离（公里）"""
     import math
@@ -111,7 +169,7 @@ def haversine(lat1, lng1, lat2, lng2):
     dlat = math.radians(lat2 - lat1)
     dlng = math.radians(lng2 - lng1)
     a = math.sin(dlat / 2) ** 2 + math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) * math.sin(dlng / 2) ** 2
-    return R * 2 * math.asin(math.sqrt(a))
+    return R * 2 * math.asin(math.sqrt(min(1.0, max(0.0, a))))
 
 
 def build_coord_map(city):
@@ -120,35 +178,25 @@ def build_coord_map(city):
     return {s["name"]: (s["lat"], s["lng"]) for s in spots if "lat" in s and "lng" in s}
 
 
-def nearest_neighbor(spots_list, coord_map):
+def nearest_neighbor(spots_list, coord_map, start_coord=None):
     """贪心最近邻算法优化游览顺序。spots_list: 景点名列表, coord_map: {名: (lat,lng)}"""
-    if not spots_list or len(spots_list) <= 1:
-        return spots_list
-
-    remaining = set(spots_list)
-    # 以第一个景点为起点
-    current = spots_list[0]
-    remaining.discard(current)
-    ordered = [current]
-
+    remaining = list(dict.fromkeys(spots_list))
+    ordered = []
+    current_coord = start_coord
     while remaining:
-        cur_coord = coord_map.get(current)
-        if not cur_coord:
-            current = remaining.pop()
-            ordered.append(current)
-            continue
-        # 找最近的未访问景点
-        nearest = min(remaining, key=lambda s: haversine(*cur_coord, *coord_map.get(s, (0, 0))))
+        nearest = remaining[0] if current_coord is None else min(
+            remaining,
+            key=lambda name: haversine(*current_coord, *coord_map[name]) if name in coord_map else float("inf"),
+        )
         ordered.append(nearest)
-        remaining.discard(nearest)
-        current = nearest
-
+        remaining.remove(nearest)
+        current_coord = coord_map.get(nearest)
     return ordered
 
 
-def _indoor_friendly(spot_type):
+def _indoor_friendly(spot_name):
     """判断景点类型是否适合雨天室内活动"""
-    return spot_type in ("文化", "美食", "娱乐", "历史")
+    return spot_name in INDOOR_SPOTS
 
 
 def _get_climate(city, month):
@@ -157,8 +205,8 @@ def _get_climate(city, month):
     w = MOCK_WEATHER.get(key, "")
     if w:
         return w
-    wttr = fetch_weather_wttr(city)
-    return wttr if wttr else ""
+    # Current weather must not stand in for an arbitrary travel month.
+    return ""
 
 
 def _is_rainy(climate):
@@ -167,54 +215,84 @@ def _is_rainy(climate):
 
 def _generate_itinerary_text(city, days, budget, preference):
     """核心行程生成逻辑（被 recommend_itinerary 和 plan_budget_tiers 共用）"""
+    error = validate_trip(days, budget)
+    if error:
+        return error
     spots = MOCK_SPOTS.get(city, [])
     if not spots:
         return f"暂无{city}的景点数据。"
 
     if preference:
-        filtered = [s for s in spots if preference in s["type"]]
+        filtered = [s for s in spots if s["type"] in preference]
         if filtered:
             spots = filtered
 
     if budget > 0:
         per_day = budget // days
         spots = [s for s in spots if s["price"] <= per_day * 0.6]
+        selected = []
+        remaining_budget = budget
+        for spot in spots:
+            if spot["price"] <= remaining_budget:
+                selected.append(spot)
+                remaining_budget -= spot["price"]
+        spots = selected
 
     if not spots:
         return f"{city}没有符合「{preference}」偏好且在预算内的景点。"
 
-    lines = [f"【{city} {days}日行程推荐】预算约{budget}元"]
-    per_day = max(1, len(spots) // days)
-    for d in range(days):
+    budget_label = f"总预算{budget}元" if budget else "未指定预算"
+    lines = [f"【{city} {days}日行程推荐】{budget_label}", "数据来源：本地模拟景点与参考票价，实际费用和开放信息需核对。"]
+    schedule = [[] for _ in range(days)]
+    durations = [0] * days
+    for spot in spots:
+        day_index = min(range(days), key=lambda index: durations[index])
+        schedule[day_index].append(spot)
+        durations[day_index] += spot["hours"]
+    for d, day_spots in enumerate(schedule):
         lines.append(f"\n第{d+1}天:")
-        day_spots = spots[d * per_day: (d + 1) * per_day]
+        if not day_spots:
+            lines.append("  - 自由活动或休息，暂无更多本地景点数据。")
         for s in day_spots:
             lines.append(f"  - {s['name']} ({s['type']}, 门票{s['price']}元, 建议{s['hours']}小时)")
+        if durations[d] > 8:
+            lines.append("  提醒：当天游览超过8小时，建议减少景点或调整天数。")
 
     total = sum(s["price"] for s in spots)
     lines.append(f"\n景点门票合计: {total}元")
-    lines.append(f"剩余预算(食宿交通): {budget - max(0, total)}元")
+    if budget:
+        lines.append(f"剩余预算(食宿交通): {budget - total}元（未包含城际交通）")
     return "\n".join(lines)
+@mcp.tool()
 def search_web(query: str) -> str:
     """搜索网络获取实时信息。query: 搜索关键词"""
+    if os.getenv("TRAVEL_OFFLINE", "").lower() in ("1", "true", "yes"):
+        return "离线模式：未执行网络搜索。"
     if not TAVILY_API_KEY:
         return "未配置 TAVILY_API_KEY，无法搜索。"
     try:
         from tavily import TavilyClient
         c = TavilyClient(api_key=TAVILY_API_KEY)
         r = c.search(query=query, search_depth="advanced", max_results=5)
-        snippets = [f"- {x['title']}: {x['content']}" for x in r.get("results", [])]
+        snippets = [f"- {x.get('title', '')}: {x.get('content', '')[:1000]}\n  来源: {x.get('url', '')}" for x in r.get("results", [])]
         return "搜索结果:\n" + "\n".join(snippets) if snippets else "无结果。"
-    except Exception as e:
-        return f"搜索失败: {e}"
+    except Exception:
+        return "搜索失败，请检查配置或稍后重试。"
 
 
 @mcp.tool()
-def optimize_route(city: str, spot_names: list[str], start_lat: float = 0, start_lng: float = 0) -> str:
+def optimize_route(city: str, spot_names: list[str], start_lat: float | None = None, start_lng: float | None = None) -> str:
     """用最近邻算法优化景点游览顺序，减少走回头路。city: 城市名, spot_names: 景点名称列表, start_lat/start_lng: 起点坐标(可选，默认第一个景点)"""
     err = validate_city(city)
     if err:
         return err
+    if not spot_names:
+        return "请至少提供一个景点。"
+    if (start_lat is None) != (start_lng is None):
+        return "起点经纬度必须同时提供。"
+    if start_lat is not None and (not math.isfinite(start_lat) or not math.isfinite(start_lng)
+                                 or not -90 <= start_lat <= 90 or not -180 <= start_lng <= 180):
+        return "起点经纬度超出有效范围。"
     coord_map = build_coord_map(city)
     if not coord_map:
         return f"暂无{city}的坐标数据。"
@@ -222,24 +300,33 @@ def optimize_route(city: str, spot_names: list[str], start_lat: float = 0, start
     if unknown:
         return f"未知景点: {unknown}"
 
-    ordered = nearest_neighbor(spot_names, coord_map)
+    start = (start_lat, start_lng) if start_lat is not None else None
+    ordered = nearest_neighbor(spot_names, coord_map, start)
     lines = [f"【{city}路线优化】按游览顺序:"]
     dists = []
-    prev_coord = (start_lat, start_lng) if start_lat and start_lng else coord_map[ordered[0]]
+    prev_coord = start if start is not None else coord_map[ordered[0]]
     for s in ordered:
         cur = coord_map[s]
         d = haversine(*prev_coord, *cur)
         dists.append(d)
         lines.append(f"  {len(lines)}. {s} (距上一点 {d:.1f}km)")
         prev_coord = cur
-    total = sum(dists[1:])  # 跳过起点到第一点的距离
-    lines.append(f"\n总路程约 {total:.1f}km")
+    total = sum(dists)
+    lines.append(f"\n景点间直线距离合计约 {total:.1f}km（含指定起点；非导航里程）")
     return "\n".join(lines)
 
 
 @mcp.tool()
-def find_events(city: str, month: str, year: int = 2026) -> str:
+def find_events(city: str, month: str, year: int | None = None) -> str:
     """搜索目的地当月演唱会/展览/节日活动。city: 城市名, month: 月份(如6月), year: 年份"""
+    error = validate_city(city) or validate_month(month)
+    if error:
+        return error
+    year = date.today().year if year is None else year
+    if not 2000 <= year <= 2100:
+        return "年份必须在 2000—2100 之间。"
+    if os.getenv("TRAVEL_OFFLINE", "").lower() in ("1", "true", "yes"):
+        return "离线模式：未查询实时活动。"
     if not TAVILY_API_KEY:
         return "未配置 TAVILY_API_KEY，无法搜索活动。"
     try:
@@ -247,10 +334,10 @@ def find_events(city: str, month: str, year: int = 2026) -> str:
         c = TavilyClient(api_key=TAVILY_API_KEY)
         query = f"{year}年{month} {city} 演唱会 展览 活动 演出"
         r = c.search(query=query, search_depth="advanced", max_results=8)
-        snippets = [f"- {x['title']}: {x['content'][:200]}" for x in r.get("results", []) if x.get("content")]
+        snippets = [f"- {x.get('title', '')}: {x['content'][:200]}\n  来源: {x.get('url', '')}" for x in r.get("results", []) if x.get("content")]
         return f"【{city}{year}年{month}活动】\n" + "\n".join(snippets) if snippets else f"未找到{city}{month}的活动信息。"
-    except Exception as e:
-        return f"搜索活动失败: {e}"
+    except Exception:
+        return "搜索活动失败，请检查配置或稍后重试。"
 
 
 @mcp.tool()
@@ -258,24 +345,33 @@ def get_weather(city: str, month: str) -> str:
     """查询城市天气。city: 城市名, month: 月份(如6月)
 
 优先用真实 API（和风天气需要 WEATHER_API_KEY），其次 wttr.in（无需 Key），最后回退模拟数据。"""
-    # 1. 和风天气（需 API Key）
+    error = validate_city(city) or validate_month(month)
+    if error:
+        return error
+    target_month = int(month[:-1])
+    climate = MOCK_WEATHER.get((city, month))
+    if target_month != date.today().month:
+        return (f"{city}{month}模拟气候参考: {climate}（非真实预报）" if climate else
+                f"暂无{city}{month}的气候数据，无法提供该月份的真实预报。")
+    # Short-term providers are used only for the current month.
     daily = fetch_weather_qweather(city)
     if daily:
-        temps = [d["tempMax"] + "-" + d["tempMin"] + "C" for d in daily]
+        temps = [str(d["tempMin"]) + "—" + str(d["tempMax"]) + "°C" for d in daily]
         texts = [d["textDay"] for d in daily]
-        return f"{city}{month}天气预报:\n" + "\n".join(
-            f"  第{i+1}天: {temps[i]}, {texts[i]}" for i in range(len(daily))
-        )
+        attribution = ", ".join(str(value) for value in daily[0].get("attributions", []))
+        return f"{city}近期天气预报（来源：和风天气；城市中心附近；非整月预报）:\n" + "\n".join(
+            f"  {daily[i]['fxDate']}: {temps[i]}, {texts[i]}" for i in range(len(daily))
+        ) + (f"\n数据归属: {attribution}" if attribution else "")
 
     # 2. wttr.in（无需 Key）
     wttr = fetch_weather_wttr(city)
     if wttr:
-        return f"{city}当前天气: {wttr}"
+        return f"{city}当前天气（来源：wttr.in；非整月预报）: {wttr}"
 
     # 3. 回退：模拟数据
     key = (city, month)
     w = MOCK_WEATHER.get(key)
-    return f"{city}{month}气候: {w}" if w else f"暂无{city}{month}天气数据。"
+    return f"{city}{month}模拟气候参考: {w}（非真实预报）" if w else f"暂无{city}{month}天气数据。"
 
 
 @mcp.tool()
@@ -292,7 +388,7 @@ def recommend_itinerary(city: str, days: int, preference: str = "", budget: int 
 @mcp.tool()
 def plan_budget_tiers(city: str, days: int, budget: int, preference: str = "") -> str:
     """生成穷游/标准/舒适三档行程方案。city:城市, days:天数, budget:总预算(元), preference:偏好"""
-    err = validate_city(city)
+    err = validate_city(city) or validate_trip(days, budget)
     if err:
         return err
 
@@ -306,7 +402,8 @@ def plan_budget_tiers(city: str, days: int, budget: int, preference: str = "") -
     for label, ratio, hotel, transport, meal in tiers:
         tier_budget = int(budget * ratio)
         spots_text = _generate_itinerary_text(city, days, tier_budget, preference)
-        results.append(f"===== {label} (约{tier_budget}元) =====")
+        warning = "，超出原预算" if tier_budget > budget else ""
+        results.append(f"===== {label} (约{tier_budget}元{warning}) =====")
         results.append(f"住宿: {hotel}")
         results.append(f"交通: {transport}")
         results.append(f"餐饮: {meal}")
@@ -318,7 +415,7 @@ def plan_budget_tiers(city: str, days: int, budget: int, preference: str = "") -
 @mcp.tool()
 def weather_adjust_schedule(city: str, month: str, spot_names: list[str], days: int = 1) -> str:
     """根据天气调整景点安排，雨天优先室内景点。city:城市, month:月份, spot_names:景点名列表, days:天数"""
-    err = validate_city(city)
+    err = validate_city(city) or validate_trip(days) or validate_month(month)
     if err:
         return err
 
@@ -327,17 +424,24 @@ def weather_adjust_schedule(city: str, month: str, spot_names: list[str], days: 
 
     coord_map = build_coord_map(city)
     spots_data = {s["name"]: s for s in MOCK_SPOTS.get(city, [])}
+    unknown = [name for name in spot_names if name not in spots_data]
+    if unknown:
+        return f"未知景点: {unknown}"
+    if not spot_names:
+        return "请至少提供一个景点。"
+    if not climate:
+        return "暂无目标月份的气候参考，无法判断是否需要雨天调整。"
 
     indoor = []
     outdoor = []
     for name in spot_names:
         s = spots_data.get(name)
-        if s and _indoor_friendly(s["type"]):
+        if s and _indoor_friendly(s["name"]):
             indoor.append(name)
         else:
             outdoor.append(name)
 
-    lines = [f"【{city}{month}天气调整】{climate}"]
+    lines = [f"【{city}{month}天气调整】模拟气候参考: {climate}（非真实预报）"]
     if rainy:
         lines.append("预计有雨，已按雨天室内(文化/美食/娱乐)优先安排：")
         optimized = indoor + outdoor[:max(1, days)]
@@ -347,7 +451,8 @@ def weather_adjust_schedule(city: str, month: str, spot_names: list[str], days: 
         optimized = spot_names
         skipped = []
 
-    ordered = nearest_neighbor(optimized, coord_map) if coord_map else optimized
+    # Keep indoor-first grouping when it rains; optimize within each group.
+    ordered = (nearest_neighbor(indoor, coord_map) + nearest_neighbor(outdoor[:max(1, days)], coord_map)) if rainy else nearest_neighbor(optimized, coord_map)
     for i, s in enumerate(ordered):
         tag = "🏠室内" if s in indoor else "🌳室外"
         lines.append(f"  {i+1}. {s} {tag}")
@@ -360,9 +465,14 @@ def weather_adjust_schedule(city: str, month: str, spot_names: list[str], days: 
 @mcp.tool()
 def packing_list(city: str, days: int, weather_summary: str = "", activities: str = "") -> str:
     """根据目的地天气和活动生成行李清单。city:城市, days:天数, weather_summary:天气描述, activities:活动类型(逗号分隔，如爬山,城市,美食)"""
+    error = validate_city(city) or validate_trip(days)
+    if error:
+        return error
     rainy = _is_rainy(weather_summary)
-    hot = any(kw in weather_summary for kw in ["热", "晒", "30"])
-    cold = any(kw in weather_summary for kw in ["冷", "寒", "5"])
+    ranges = re.findall(r"(?<![\d.])([+-]?\d+(?:\.\d+)?)\s*(?:[-—~至]\s*([+-]?\d+(?:\.\d+)?))?\s*(?:°?C|℃|度)", weather_summary, re.I)
+    temperatures = [float(value) for pair in ranges for value in pair if value]
+    hot = any(kw in weather_summary for kw in ("热", "晒")) or any(value >= 30 for value in temperatures)
+    cold = any(kw in weather_summary for kw in ("冷", "寒")) or any(value <= 10 for value in temperatures)
 
     lines = [f"【{city} {days}日行李清单】"]
 
@@ -432,7 +542,7 @@ def get_food_recommendation(city: str) -> str:
     foods = MOCK_FOOD.get(city)
     if not foods:
         return f"暂无{city}的美食数据。"
-    return f"{city}必尝美食及参考价格:\n" + "\n".join(f"  - {f}" for f in foods)
+    return f"{city}美食及参考价格（本地模拟数据）:\n" + "\n".join(f"  - {f}" for f in foods)
 
 
 @mcp.tool()
@@ -448,10 +558,11 @@ def estimate_daily_cost(city: str) -> str:
         "成都": "住宿150-350元/晚, 餐饮70-150元/天, 交通15-30元/天",
         "广州": "住宿200-400元/晚, 餐饮80-150元/天, 交通20-40元/天",
     }
-    return estimates.get(city, f"暂无{city}的消费估算数据。请根据实际情况调整。")
+    estimate = estimates.get(city)
+    return f"{estimate}（本地模拟估算，不含门票和城际交通）" if estimate else f"暂无{city}的消费估算数据。请根据实际情况调整。"
 
 
 if __name__ == "__main__":
-    has_api = "已配置" if WEATHER_API_KEY else "未配置(使用模拟数据)"
-    print(f"[天气API] {has_api}")
+    has_api = "已配置" if WEATHER_API_KEY and WEATHER_API_HOST else "未完整配置（wttr.in 或模拟数据兜底）"
+    print(f"[天气API] {has_api}", file=sys.stderr)
     mcp.run(transport="stdio")

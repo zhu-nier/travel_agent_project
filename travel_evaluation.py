@@ -1,51 +1,10 @@
 """旅游助手评测：测试集 + 自动化评估"""
 import asyncio
-import re
 import sys
-from pathlib import Path
-from dotenv import load_dotenv
-load_dotenv()
 
-from mcp import ClientSession, StdioServerParameters
-from mcp.client.stdio import stdio_client
-from langchain.chat_models import init_chat_model
-from langchain_core.tools import StructuredTool
-from langchain.messages import SystemMessage, HumanMessage, ToolMessage, AIMessage
-from langgraph.graph import StateGraph, START, END
-from langgraph.checkpoint.memory import MemorySaver
-from typing import Annotated, TypedDict
-import operator
+from langchain_core.messages import HumanMessage
 
-
-class State(TypedDict):
-    messages: Annotated[list, operator.add]
-
-
-def convert(t, s):
-    async def call(**kw):
-        r = await s.call_tool(t.name, kw)
-        return r.content[0].text
-    return StructuredTool(name=t.name, description=t.description or t.name, args_schema=t.inputSchema, coroutine=call)
-
-
-def check_missing_info(state):
-    """Check for missing required info in conversation. Returns list of missing fields."""
-    msgs = state["messages"]
-    text = "\n".join(m.content or "" for m in msgs if hasattr(m, "content") and m.content)
-
-    checks = {
-        "城市": r"(北京|上海|广州|深圳|成都|杭州|南京|重庆|武汉|西安|苏州|天津|长沙|厦门|青岛|大连)|\w+市",
-        "月份": r"\d+月|下个月|这个月|本月|六月|七月|八月|九月",
-        "天数": r"\d+天|\d+日",
-        "预算": r"\d+[块元]|预算.*\d|\d+.*预算|预算",
-    }
-
-    missing = []
-    for field, pattern in checks.items():
-        if not re.search(pattern, text):
-            missing.append(field)
-    return missing
-
+from travel_core import agent_session, check_missing_info
 
 # ====== 测试用例 ======
 # question: 输入
@@ -183,7 +142,7 @@ def check_asked_question(messages, expected_ask):
         if m.type == "ai" and not (hasattr(m, "tool_calls") and m.tool_calls):
             content = m.content or ""
             # 信息收集关键词（问具体缺失字段，不含"还有什么"类反问）
-            info_question_kw = ["去哪个城市", "去哪里", "什么时间", "哪天", "几天",
+            info_question_kw = ["请补充", "去哪个城市", "去哪里", "什么时间", "哪天", "几天",
                                 "预算", "多少", "偏好", "喜欢什么", "有没有"]
             if any(kw in content for kw in info_question_kw):
                 return True if expected_ask else False, "追问了信息"
@@ -198,185 +157,132 @@ def check_asked_question(messages, expected_ask):
 
 
 async def evaluate():
-    params = StdioServerParameters(
-        command=sys.executable,
-        args=[str(Path(__file__).parent / "travel_mcp_server_v2.py")],
-    )
+    async with agent_session() as g:
+        # ====== 跑评测 ======
+        simple_cases = [tc for tc in TEST_CASES if "turns" not in tc]
+        multi_cases = [tc for tc in TEST_CASES if "turns" in tc]
 
-    async with stdio_client(params) as (r, w):
-        async with ClientSession(r, w) as s:
-            await s.initialize()
-            tools_def = await s.list_tools()
-            lc_tools = [convert(t, s) for t in tools_def.tools]
-            tm = {t.name: t for t in lc_tools}
+        print("=" * 80)
+        print("                    旅游助手评测报告")
+        print("=" * 80)
 
-            llm = init_chat_model("deepseek-chat", temperature=0.3)
-            llm_no_tools = init_chat_model("deepseek-chat", temperature=0.3)
-            agent = llm.bind_tools(lc_tools)
+        all_passed = 0
+        all_total = 0
 
-            def agent_node(state: State):
-                missing = check_missing_info(state)
-                system = SystemMessage(content=f"""你是旅游规划助手。
-必须收集完以下信息才能查工具：城市、月份、天数、预算。
-当前缺失：{', '.join(missing) if missing else '无'}。
-缺任何一项就直接问用户，不要调用工具。
-完整工作流：
-  1. get_weather(查天气)
-  2. find_events(搜当月活动)
-  3. plan_budget_tiers(生成三档方案) 或 recommend_itinerary(单方案)
-  4. optimize_route(优化各天路线)
-  5. weather_adjust_schedule(雨天调整室内外)
-  6. get_food_recommendation(美食)
-  7. estimate_daily_cost(消费估算)
-  8. packing_list(生成行李清单)
-生成完整行程，按天展示，每项含价格、时长和间距，末尾算总预算。
-不要使用 emoji 符号。""")
-                msg = agent.invoke([system] + state["messages"])
-                if missing and hasattr(msg, "tool_calls") and msg.tool_calls:
-                    question = llm_no_tools.invoke([
-                        SystemMessage(content=f"用户提供了部分信息，但还缺少：{', '.join(missing)}。请用中文礼貌地问用户这些信息。不要调用任何工具，不要回答其他问题。"),
-                        HumanMessage(content=state["messages"][-1].content or "请帮我规划行程")
-                    ])
-                    return {"messages": [AIMessage(content=question.content)]}
-                return {"messages": [msg]}
+        for tc in simple_cases:
+            print(f"\n--- [{tc['id']}] ---")
+            print(f"  输入: {tc['question'][:50]}")
+            print(f"  期望: {tc['desc']}")
 
-            async def tool_node(state: State):
-                last = state["messages"][-1]
-                results = []
-                for tc in last.tool_calls:
-                    t = tm.get(tc["name"])
-                    if t:
-                        r = await t.ainvoke(tc["args"])
-                        results.append(ToolMessage(content=r, tool_call_id=tc["id"]))
-                return {"messages": results}
+            cfg = {"configurable": {"thread_id": f"eval-{tc['id']}"}, "recursion_limit": 20}
 
-            def router(state: State):
-                last = state["messages"][-1] if state["messages"] else None
-                if last and hasattr(last, "tool_calls") and last.tool_calls:
-                    return "tools"
-                return END
+            async for ev in g.astream(
+                {"messages": [HumanMessage(content=tc["question"])], "tool_rounds": 0},
+                config=cfg,
+                stream_mode="updates",
+            ):
+                pass
 
-            b = StateGraph(State)
-            b.add_node("agent", agent_node)
-            b.add_node("tools", tool_node)
-            b.add_edge(START, "agent")
-            b.add_conditional_edges("agent", router, {"tools": "tools", END: END})
-            b.add_edge("tools", "agent")
-            g = b.compile(checkpointer=MemorySaver())
+            result = g.get_state(cfg)
+            messages = result.values["messages"]
 
-            # ====== 跑评测 ======
-            simple_cases = [tc for tc in TEST_CASES if "turns" not in tc]
-            multi_cases = [tc for tc in TEST_CASES if "turns" in tc]
+            checks = []
+            # 1. 工具调用检查
+            if "expect_tools" in tc and tc["expect_tools"] is not None:
+                allow = tc.get("allow_extra", False)
+                alts = tc.get("alternatives", None)
+                ok, msg = check_tools_called(messages, tc["expect_tools"], allow_extra=allow, alternatives=alts)
+                checks.append((ok, f"工具调用: {msg}"))
+            elif "expect_tools" in tc and tc["expect_tools"] is None:
+                # 至少调了一个工具
+                called = set()
+                for m in messages:
+                    if hasattr(m, "tool_calls") and m.tool_calls:
+                        for tc2 in m.tool_calls:
+                            called.add(tc2["name"])
+                ok = len(called) > 0
+                checks.append((ok, f"至少调一个工具: {called if ok else '未调用任何工具'}"))
 
-            print("=" * 80)
-            print("                    旅游助手评测报告")
-            print("=" * 80)
+            # 2. 城市参数检查
+            if tc.get("expect_city"):
+                ok, msg = check_city_in_tool_calls(messages, tc["expect_city"])
+                checks.append((ok, f"城市验证: {msg}"))
 
-            all_passed = 0
-            all_total = 0
+            # 3. 追问检查
+            if "expect_ask" in tc:
+                ok, msg = check_asked_question(messages, tc["expect_ask"])
+                checks.append((ok, f"追问行为: {msg}"))
 
-            for tc in simple_cases:
-                print(f"\n--- [{tc['id']}] ---")
-                print(f"  输入: {tc['question'][:50]}")
-                print(f"  期望: {tc['desc']}")
+            # 评分
+            passed = all(ok for ok, _ in checks)
+            all_passed += 1 if passed else 0
+            all_total += 1
 
-                cfg = {"configurable": {"thread_id": f"eval-{tc['id']}"}}
+            for ok, msg in checks:
+                status = "PASS" if ok else "FAIL"
+                print(f"  [{status}] {msg}")
 
-                msg_count_before = 0
+            if passed:
+                print(f"  >> 结果: PASS")
+            else:
+                print(f"  >> 结果: FAIL")
+
+        # 多轮对话测试
+        for tc in multi_cases:
+            print(f"\n--- [{tc['id']}] ---")
+            print(f"  多轮对话: {tc['turns']}")
+            print(f"  期望: {tc['desc']}")
+
+            cfg = {"configurable": {"thread_id": f"eval-multi-{tc['id']}"}, "recursion_limit": 20}
+
+            checks = []
+            for i, turn in enumerate(tc["turns"]):
+                previous = g.get_state(cfg).values.get("messages", [])
+                previous_count = len(previous)
                 async for ev in g.astream(
-                    {"messages": [HumanMessage(content=tc["question"])]},
+                    {"messages": [HumanMessage(content=turn)], "tool_rounds": 0},
                     config=cfg,
                     stream_mode="updates",
                 ):
-                    for node, up in ev.items():
-                        if "messages" in up:
-                            msg_count_before += 1
-
-                result = g.get_state(cfg)
-                messages = result.values["messages"]
-
-                checks = []
-                # 1. 工具调用检查
-                if "expect_tools" in tc and tc["expect_tools"] is not None:
-                    allow = tc.get("allow_extra", False)
-                    alts = tc.get("alternatives", None)
-                    ok, msg = check_tools_called(messages, tc["expect_tools"], allow_extra=allow, alternatives=alts)
-                    checks.append((ok, f"工具调用: {msg}"))
-                elif "expect_tools" in tc and tc["expect_tools"] is None:
-                    # 至少调了一个工具
-                    called = set()
-                    for m in messages:
-                        if hasattr(m, "tool_calls") and m.tool_calls:
-                            for tc2 in m.tool_calls:
-                                called.add(tc2["name"])
-                    ok = len(called) > 0
-                    checks.append((ok, f"至少调一个工具: {called if ok else '未调用任何工具'}"))
-
-                # 2. 城市参数检查
-                if tc.get("expect_city"):
-                    ok, msg = check_city_in_tool_calls(messages, tc["expect_city"])
-                    checks.append((ok, f"城市验证: {msg}"))
-
-                # 3. 追问检查
-                if "expect_ask" in tc:
-                    ok, msg = check_asked_question(messages, tc["expect_ask"])
-                    checks.append((ok, f"追问行为: {msg}"))
-
-                # 评分
-                passed = all(ok for ok, _ in checks)
-                all_passed += 1 if passed else 0
-                all_total += 1
-
-                for ok, msg in checks:
-                    status = "PASS" if ok else "FAIL"
-                    print(f"  [{status}] {msg}")
-
-                if passed:
-                    print(f"  >> 结果: PASS")
+                    pass
+                turn_messages = g.get_state(cfg).values["messages"][previous_count:]
+                if i < len(tc["turns"]) - 1:
+                    ok, detail = check_tools_called(turn_messages, [])
+                    checks.append((ok, f"第{i+1}轮信息未全禁止工具: {detail}"))
+                    ok, detail = check_asked_question(turn_messages, True)
+                    checks.append((ok, f"第{i+1}轮追问: {detail}"))
                 else:
-                    print(f"  >> 结果: FAIL")
+                    ok, detail = check_asked_question(turn_messages, False)
+                    checks.append((ok, f"最后一轮直接规划: {detail}"))
 
-            # 多轮对话测试
-            for tc in multi_cases:
-                print(f"\n--- [{tc['id']}] ---")
-                print(f"  多轮对话: {tc['turns']}")
-                print(f"  期望: {tc['desc']}")
+            result = g.get_state(cfg)
+            messages = result.values["messages"]
+            tool_calls_count = sum(1 for m in turn_messages if getattr(m, "tool_calls", []))
 
-                cfg = {"configurable": {"thread_id": "eval-multi-turn"}}
+            # 多轮最后一轮应该调工具
+            if tc.get("expect_final_tools"):
+                ok = tool_calls_count > 0
+                checks.append((ok, f"多轮最终调工具: {tool_calls_count} 次工具调用"))
 
-                for i, turn in enumerate(tc["turns"]):
-                    async for ev in g.astream(
-                        {"messages": [HumanMessage(content=turn)]},
-                        config=cfg,
-                        stream_mode="updates",
-                    ):
-                        pass
+            passed = all(ok for ok, _ in checks)
+            all_passed += 1 if passed else 0
+            all_total += 1
 
-                result = g.get_state(cfg)
-                messages = result.values["messages"]
-                tool_calls_count = sum(1 for m in messages if hasattr(m, "tool_calls") and m.tool_calls)
+            for ok, msg in checks:
+                status = "PASS" if ok else "FAIL"
+                print(f"  [{status}] {msg}")
 
-                checks = []
-                final_asked = check_asked_question(messages, False)
-                # 多轮最后一轮应该调工具
-                if tc.get("expect_final_tools"):
-                    ok = tool_calls_count > 0
-                    checks.append((ok, f"多轮最终调工具: {tool_calls_count} 次工具调用"))
+            print(f"  >> 结果: {'PASS' if passed else 'FAIL'}")
 
-                passed = all(ok for ok, _ in checks)
-                all_passed += 1 if passed else 0
-                all_total += 1
-
-                for ok, msg in checks:
-                    status = "PASS" if ok else "FAIL"
-                    print(f"  [{status}] {msg}")
-
-                print(f"  >> 结果: {'PASS' if passed else 'FAIL'}")
-
-            print("\n" + "=" * 80)
-            print(f"  合计: {all_passed}/{all_total} 通过 ({all_passed/all_total*100:.0f}%)")
-            print("=" * 80)
+        print("\n" + "=" * 80)
+        print(f"  合计: {all_passed}/{all_total} 通过 ({all_passed/all_total*100:.0f}%)")
+        print("=" * 80)
+        return all_passed == all_total
 
 
 if __name__ == "__main__":
-    asyncio.run(evaluate())
+    try:
+        raise SystemExit(0 if asyncio.run(evaluate()) else 1)
+    except ValueError as error:
+        print(error, file=sys.stderr)
+        raise SystemExit(1)
